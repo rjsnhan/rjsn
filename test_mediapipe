@@ -1,0 +1,185 @@
+import cv2
+import torch
+import numpy as np
+import mediapipe as mp
+import argparse
+import os
+import sys
+from PIL import Image, ImageFont, ImageDraw
+from datetime import datetime
+from torchvision import models
+from torchvision.models import ResNet50_Weights
+import torch.nn as nn
+from model import resume_checkpoint
+from logger import setup_logger
+
+//가중치 파일 접근 함수
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--name", default="100%/1,2,3", type=str)
+    parser.add_argument("--output_dir", default="checkpoint", type=str)
+    parser.add_argument("--data", default="skin", type=str)
+    parser.add_argument("--mode", default="class", choices=["class"], type=str)
+    return parser.parse_args()
+
+// 부위 라벨 정의
+REGION_LABEL = {
+    1: "이마",
+    2: "미간",
+    3: "왼눈가",
+    4: "오른눈가",
+    5: "왼볼",
+    6: "오른볼",
+    7: "입술",
+    8: "턱"
+}
+// 각 부위가 접근하는 체크포인트 번호
+REGION_MODEL = {
+    1: 1, 2: 2, 3: 3, 4: 3,
+    5: 5, 6: 5, 7: 7, 8: 8
+}
+
+// 각 체크포인트의 클래스 수
+MODEL_CLASS = {
+    1: 15, 2: 7, 3: 7, 5: 12, 7: 5, 8: 7
+}
+
+// 각 체크포인트의 세부 클래스 수 정의
+REGION_OUTPUT_SPLIT = {
+    1: [("주름", 9), ("색소침착", 6)],
+    2: [("주름", 7)],
+    3: [("주름", 7)],
+    4: [("주름", 7)],
+    5: [("색소침착", 6), ("모공", 6)],
+    6: [("색소침착", 6), ("모공", 6)],
+    7: [("건조도", 5)],
+    8: [("처짐", 7)]
+}
+
+// 랜드마크를 이용해 각 부위에 바운딩박스
+REGION_LANDMARKS = {
+    1: [10, 67, 297, 66, 334],
+    2: [9, 107, 336, 189, 413],
+    3: [34, 139, 225, 117, 116],
+    4: [445, 368, 261, 454],
+    5: [50, 117, 147, 192, 216, 142, 119],
+    6: [280, 329, 423, 436, 346, 435 ],
+    7: [61, 78, 191, 80, 81, 13, 14, 88, 178, 95, 375, 308],
+    8: [365, 377, 136]
+}
+
+// 모델 불러오기
+def load_models(args):
+    logger = setup_logger(args.name, args.mode + f"_{args.data}")
+    logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 모델 로드 시작")
+    check_path = os.path.join(args.output_dir, args.mode, args.name)
+
+    model_dict = {}
+    for region_idx, model_idx in REGION_MODEL.items():
+        if model_idx in model_dict:
+            continue
+
+        model = models.resnet50(weights=ResNet50_Weights.DEFAULT)
+        model.fc = nn.Linear(model.fc.in_features, MODEL_CLASS[model_idx])
+
+        ckpt_path = os.path.join(check_path, str(model_idx), "state_dict.bin")
+        if not os.path.isfile(ckpt_path):
+            raise FileNotFoundError(f"❌ Checkpoint 없음: {ckpt_path}")
+
+        model = resume_checkpoint(args, model, ckpt_path)
+        model.eval()
+        model_dict[model_idx] = model
+
+    logger.info("✅ 모델 로드 완료")
+    return model_dict, logger
+
+// 바운딩 박스 추출 함수
+def extract_bbox(landmarks, indices, image_shape, padding=10):
+    h, w, _ = image_shape
+    xs = [int(landmarks[i].x * w) for i in indices]
+    ys = [int(landmarks[i].y * h) for i in indices]
+    x1 = max(min(xs) - padding, 0)
+    y1 = max(min(ys) - padding, 0)
+    x2 = min(max(xs) + padding, w)
+    y2 = min(max(ys) + padding, h)
+    return x1, y1, x2, y2
+
+//한국어 텍스트 출력 함수
+def draw_korean_text(frame, text, x, y):
+    image_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(image_pil)
+    font_path = "C:/Windows/Fonts/malgun.ttf"
+    font = ImageFont.truetype(font_path, 20)
+    draw.text((x, y), text, font=font, fill=(0, 255, 255))
+    return cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
+
+// 실시간 분석 함수
+def run_realtime_analysis(model_dict, logger, args):
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    mp_face_mesh = mp.solutions.face_mesh
+    face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1)
+    transform = ResNet50_Weights.DEFAULT.transforms()
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("❌ 프레임을 가져올 수 없습니다!")
+            break
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = face_mesh.process(rgb)
+
+        if results.multi_face_landmarks:
+            for landmarks in results.multi_face_landmarks:
+                for region_idx, indices in REGION_LANDMARKS.items():
+                    x1, y1, x2, y2 = extract_bbox(landmarks.landmark, indices, frame.shape)
+                    face_crop = frame[y1:y2, x1:x2]
+                    if face_crop.size == 0:
+                        continue
+                    face_crop_pil = Image.fromarray(cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB))
+                    input_tensor = transform(face_crop_pil).unsqueeze(0)
+
+                    model_idx = REGION_MODEL[region_idx]
+                    model = model_dict[model_idx]
+
+                    try:
+                        with torch.no_grad():
+                            output = model(input_tensor)
+
+                        splits = REGION_OUTPUT_SPLIT[region_idx]
+                        start = 0
+                        results_list = []
+                        for item_name, length in splits:
+                            pred = torch.argmax(output[:, start:start+length], dim=1).item()
+                            results_list.append(f"{item_name}: {pred}")
+                            start += length
+
+                        label = f"{REGION_LABEL.get(region_idx)} - " + ", ".join(results_list)
+                        frame = cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        frame = draw_korean_text(frame, label, x1, y1 - 25)
+
+                    except Exception as e:
+                        print(f"[에러] 부위 {region_idx}: {e}")
+
+        cv2.imshow("Real-time Skin Analysis - 8 Regions", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+ 
+// 체크포인트의 경로   
+sys.argv = [
+    'realtime_face8_v2.py',
+    '--output_dir', 'C:/Users/pwy00/korean_skin_data/1.model/3.docker_image/NIA_2023_019/NIA/checkpoint',
+    '--mode', 'class',
+    '--name', '100%/1,2,3'
+]
+
+if __name__ == "__main__":
+    args = parse_args()
+    model_dict, logger = load_models(args)
+    run_realtime_analysis(model_dict, logger, args)
